@@ -8,9 +8,12 @@ import subprocess
 import argparse
 import tempfile
 import numpy as np
+from tqdm import tqdm
 from collections import defaultdict
 from PyReconstruct.modules.datatypes import Series
 from PyReconstruct.modules.backend.view.trace_layer import hashName
+
+ONLY_EXTRACT_NEURONS = False
 
 
 temp_jser = tempfile.NamedTemporaryFile(suffix=".jser", delete=False).name
@@ -48,73 +51,81 @@ if args.groups:
 else:
     groups = ['neurons', 'axons', 'dendrites', 'spines', 'endosomes', 'ribosomes', 'ser', 'spine_apparatus', 'synapses','mito']
 
-groups2 = [g for g in groups if g != 'neurons']
-run_command += ['-g',' '.join(groups2)]
-
-
-print(run_command)
-# convert jser to Series object
-in_series = Series.openJser(temp_jser)
-
-# extract trace names
-trace_names = in_series.objects.getNames()
-
-def get_object_type(input_string, object_types=["sp", "ax", "c", "endo", "r", "ser", "sa"]):
-    if 'endo' in input_string:
-        input_string = input_string.split('_')[0]
-    or_object_type_pattern = "|".join(object_types)
-    pattern = fr'^(d([0-9]{{2}}))(({or_object_type_pattern})(h|n|b|s)?([0-9]{{2,3}}))$'
-    match = re.match(pattern, input_string)
+if not ONLY_EXTRACT_NEURONS:
+    groups2 = [g for g in groups if g != 'neurons']
+    run_command += ['-g',' '.join(groups2)]
     
-    # if we have an object that is associated with a dendrite
-    if match is not None:
-        return match.groups()[3], match.groups()[1]
+    
+    print(run_command)
+    # convert jser to Series object
+    in_series = Series.openJser(temp_jser)
+    
+    # extract trace names
+    trace_names = in_series.objects.getNames()
+    
+    def get_object_type(input_string, object_types=["sp", "ax", "c", "endo", "r", "ser", "sa"]):
+        if 'endo' in input_string:
+            input_string = input_string.split('_')[0]
+        or_object_type_pattern = "|".join(object_types)
+        pattern = fr'^(d([0-9]{{2}}))(({or_object_type_pattern})(h|n|b|s)?([0-9]{{2,3}}))$'
+        match = re.match(pattern, input_string)
         
-    # otherwise we might have a dendrite
-    pattern = r'^(d([0-9]{2}))$'
-    match = re.match(pattern, input_string)
-    if match is not None:
-        return "d", match.groups()[1]
+        # if we have an object that is associated with a dendrite
+        if match is not None:
+            return match.groups()[3], match.groups()[1]
+            
+        # otherwise we might have a dendrite
+        pattern = r'^(d([0-9]{2}))$'
+        match = re.match(pattern, input_string)
+        if match is not None:
+            return "d", match.groups()[1]
+        
+        # otherwise we might have a mitochondrion
+        pattern = r'^(mito([0-9]{2}))$'
+        match = re.match(pattern, input_string)
+        if match is not None:
+            return "mito",match.groups()[1]
     
-    # otherwise we might have a mitochondrion
-    pattern = r'^(mito([0-9]{2}))$'
-    match = re.match(pattern, input_string)
-    if match is not None:
-        return "mito",match.groups()[1]
+    
+        # otherwise we don't really know what this object is.
+        return None, None
+    
+    segment_properties = defaultdict(dict)
+    group_names = {'sp':'spines','ax':'axons','d':'dendrites','c':'synapses','r':'ribosomes','ser':'ser','sa':'spine_apparatus','endo':'endosomes','mito':'mito'}
+    neuron_dict = defaultdict(list)
+    hash_to_trace = {}
+    for trace in trace_names:
+        obj,neuron = get_object_type(trace,list(group_names.keys()))
+        if obj is not None:
+            id = hashName(trace)
+            id = str(id)
+            trace = str(trace)
+            hash_to_trace[id] = trace
+            if obj == 'sp' or obj == 'd':
+                neuron_dict[neuron].append(id)
+                segment_properties['neurons'][id] = trace
+            if obj == 'ax':
+                neuron_dict[id] = [id]
+                segment_properties['neurons'][id] = trace
+            in_series.object_groups.add(group_names[obj],trace)
+            segment_properties[group_names[obj]][id] = trace
+    
+    print(segment_properties)
+    
+    in_series.save()
+    in_series.saveJser()
+    
+    in_series.close()
+    
+    with open("lookup.json","w") as f:
+        json.dump(neuron_dict, f, indent=4)
+    
+    subprocess.run(run_command, check=True, stderr=subprocess.STDOUT)
 
+if ONLY_EXTRACT_NEURONS:
+    with open("lookup.json","r") as f:
+        neuron_dict = json.load(f)
 
-    # otherwise we don't really know what this object is.
-    return None, None
-
-segment_properties = defaultdict(dict)
-group_names = {'sp':'spines','ax':'axons','d':'dendrites','c':'synapses','r':'ribosomes','ser':'ser','sa':'spine_apparatus','endo':'endosomes','mito':'mito'}
-neuron_dict = defaultdict(list)
-hash_to_trace = {}
-for trace in trace_names:
-    obj,neuron = get_object_type(trace,list(group_names.keys()))
-    if obj is not None:
-        id = hashName(trace)
-        hash_to_trace[id] = trace
-        if obj == 'sp' or obj == 'd':
-            neuron_dict[neuron].append(id)
-            segment_properties['neurons'][id] = trace
-        if obj == 'ax':
-            neuron_dict[id] = id
-            segment_properties['neurons'][id] = trace
-        in_series.object_groups.add(group_names[obj],trace)
-        segment_properties[group_names[obj]][id] = trace
-
-print(segment_properties)
-
-in_series.save()
-in_series.saveJser()
-
-in_series.close()
-
-with open("lookup.json","w") as f:
-    json.dump(neuron_dict, f, indent=4)
-
-subprocess.run(run_command, check=True, stderr=subprocess.STDOUT)
 
 if 'neurons' in groups:
     # add neuron labels
@@ -127,12 +138,27 @@ if 'neurons' in groups:
 
     neuron_labels = np.zeros_like(s_arr)
 
-    for i in neuron_dict.keys():
+    for i in tqdm(neuron_dict, desc="combining labels for neurons"):
         neuron_label = np.zeros_like(s_arr)
         ids = neuron_dict[i]
-        for id in ids:
-            mask = np.logical_or(d_arr==id, s_arr==id, a_rr==id)
-            neuron_labels[mask] = int(i)
+        ids = [int(s) for s in ids]
+        mask = np.isin(s_arr, ids) | np.isin(d_arr, ids) | np.isin(a_arr, ids)
+        neuron_labels[mask] = int(i)
+
+        #print(mask)
+        #print(s_arr)
+        #print(d_arr)
+        #print(a_arr)
+        #print(ids)
+        #print(i)
+        #print(type(i))
+        #print(np.sum(mask))
+
+        #for id in ids:
+        #    id = int(id)
+        #    mask = np.logical_or(d_arr==id, s_arr==id, a_arr==id)
+        #    neuron_labels[mask] = int(i)
+        #break
 
     z['labels_neurons'] = neuron_labels
     z['labels_neurons'].attrs['resolution'] = z['labels_dendrites'].attrs['resolution']

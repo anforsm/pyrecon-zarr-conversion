@@ -1,0 +1,4 @@
+source/*
+target/*
+lookup.json
+__pycache__/*
